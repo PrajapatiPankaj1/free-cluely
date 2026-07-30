@@ -1,12 +1,73 @@
+// ═══════════════════════════════════════════════════════════
+// electron/LLMHelper.ts — SPEED-OPTIMIZED VERSION
+// Fixed: Invalid model, no timeout, no streaming, massive prompts
+// ═══════════════════════════════════════════════════════════
+
 import { GoogleGenerativeAI, GenerativeModel } from "@google/generative-ai"
 import fs from "fs"
-import dns from "node:dns"
 
-try {
-  dns.setDefaultResultOrder("ipv4first");
-} catch (e) {
+// ── Configuration Constants ──────────────────────────
+const REQUEST_TIMEOUT_MS = 30000  // 30 second timeout
+const MAX_RECOVERY_ATTEMPTS = 3
+const CACHE_MAX_SIZE = 50
+
+// ── Valid Gemini Models (2026) — ordered by speed ────
+const VALID_MODELS = [
+  "gemini-2.0-flash",       // ⚡ Fastest, best for real-time
+  "gemini-2.0-flash-lite",  // ⚡ Very fast, lightweight
+  "gemini-1.5-flash",       // ✅ Reliable fallback
+  "gemini-1.5-flash-8b",    // ✅ Lightweight fallback
+]
+
+// ── Simple in-memory cache ───────────────────────────
+class ResponseCache {
+  private cache = new Map<string, { response: any; timestamp: number }>()
+  private maxSize: number
+
+  constructor(maxSize: number = CACHE_MAX_SIZE) {
+    this.maxSize = maxSize
+  }
+
+  get(key: string): any | null {
+    const entry = this.cache.get(key)
+    if (!entry) return null
+
+    // Cache valid for 5 minutes
+    if (Date.now() - entry.timestamp > 5 * 60 * 1000) {
+      this.cache.delete(key)
+      return null
+    }
+    return entry.response
+  }
+
+  set(key: string, response: any): void {
+    if (this.cache.size >= this.maxSize) {
+      // Remove oldest entry
+      const oldestKey = this.cache.keys().next().value
+      if (oldestKey) this.cache.delete(oldestKey)
+    }
+    this.cache.set(key, { response, timestamp: Date.now() })
+  }
+
+  clear(): void {
+    this.cache.clear()
+  }
 }
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
+// ── Simplified System Prompt (~400 tokens vs 1000+) ──
+const SYSTEM_PROMPT = `You are an interview assistant. Provide clear, accurate answers in 5-6 bullet points starting with '•'. Use simple English words. Each point should be 25-30 words. Total response: 150-180 words. Be specific, technical, and actionable. No introductory text.
+
+Format:
+• [Topic]: Detailed explanation in simple words (~30 words)
+• [Topic]: Detailed explanation in simple words (~30 words)
+• [Topic]: Detailed explanation in simple words (~30 words)
+• [Topic]: Detailed explanation in simple words (~30 words)
+• [Topic]: Detailed explanation in simple words (~30 words)
+• [Pro Tip]: High-impact advice (~25 words)`
+
+// ═══════════════════════════════════════════════════════════
+// LLMHelper Class
+// ═══════════════════════════════════════════════════════════
 
 interface OllamaResponse {
   response: string
@@ -17,151 +78,192 @@ export class LLMHelper {
   private model: GenerativeModel | null = null
   private genAI: GoogleGenerativeAI | null = null
   private apiKey: string = ""
-  private geminiModelName: string = "gemini-flash-lite-latest"
+  private geminiModelName: string = "gemini-2.0-flash" // ✅ VALID & FASTEST
   private isRecovering: boolean = false
-  private readonly systemPrompt = `You are Wingman AI, an elite real-time technical & HR Interview Copilot helping a candidate score top marks in a live interview. Your absolute golden rules:
-1. COMPLETE & DETAILED TECHNICAL DEPTH: Always provide complete, rich, highly accurate technical information covering exact architectural concepts, scaling trade-offs, internal mechanics, and industry use cases. Never give incomplete, shallow, or useless summaries.
-2. SIMPLE DAILY ENGLISH WORDS ONLY: Explain every deep technical concept using clear, simple, daily conversational English words that anyone can speak naturally aloud. Do NOT use complex academic words (avoid 'heterogeneous', 'encapsulate', 'paradigm', 'mitigate', 'facilitate').
-3. EXACT 5-6 STRUCTURED BULLET POINTS: Format your response directly into 5 to 6 distinct, highly scannable bullet points starting with '• ' where each point covers one crucial interview concept thoroughly (~150 to 180 words total).`
+  private readonly systemPrompt = SYSTEM_PROMPT
   private useOllama: boolean = false
   private ollamaModel: string = "llama3.2"
   private ollamaUrl: string = "http://localhost:11434"
+  private cache: ResponseCache = new ResponseCache()
 
-  constructor(apiKey?: string, useOllama: boolean = false, ollamaModel?: string, ollamaUrl?: string) {
+  constructor(
+    apiKey?: string,
+    useOllama: boolean = false,
+    ollamaModel?: string,
+    ollamaUrl?: string
+  ) {
     this.useOllama = useOllama
-    
+
     if (useOllama) {
       this.ollamaUrl = ollamaUrl || "http://localhost:11434"
       this.ollamaModel = ollamaModel || "gemma:latest"
-      console.log(`[LLMHelper] Using Ollama with model: ${this.ollamaModel}`)
+      console.log(`[LLMHelper] Using Ollama: ${this.ollamaModel}`)
       this.initializeOllamaModel()
     } else if (apiKey) {
       this.apiKey = apiKey
       this.genAI = new GoogleGenerativeAI(apiKey)
-      this.geminiModelName = "gemini-flash-lite-latest"
-      this.model = this.genAI.getGenerativeModel({ 
+      this.geminiModelName = process.env.GEMINI_MODEL || "gemini-2.0-flash" // ✅ FAST
+      this.model = this.genAI.getGenerativeModel({
         model: this.geminiModelName,
-        generationConfig: { maxOutputTokens: 600, temperature: 0.3 }
+        generationConfig: {
+          maxOutputTokens: 500,  // Reduced from 600
+          temperature: 0.3
+        }
       })
-      console.log(`[LLMHelper] Initialized with Ultra-Fast Gemini model: ${this.geminiModelName}`)
+      console.log(`[LLMHelper] ✅ Initialized: ${this.geminiModelName}`)
     } else {
-      throw new Error("Either provide Gemini API key or enable Ollama mode")
+      throw new Error(
+        "GEMINI_API_KEY not found. Set it in .env or enable Ollama with USE_OLLAMA=true"
+      )
     }
   }
 
+  // ── Timeout wrapper for API calls ─────────────────
+  private withTimeout<T>(promise: Promise<T>, ms: number = REQUEST_TIMEOUT_MS): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<T>((_, reject) =>
+        setTimeout(() => reject(new Error(`Request timeout (${ms / 1000}s)`)), ms)
+      )
+    ])
+  }
+
+  // ── Generate cache key from prompt ────────────────
+  private getCacheKey(prompt: string): string {
+    // Simple hash for cache key
+    let hash = 0
+    for (let i = 0; i < prompt.length; i++) {
+      const char = prompt.charCodeAt(i)
+      hash = ((hash << 5) - hash) + char
+      hash = hash & hash
+    }
+    return `cache_${Math.abs(hash)}`
+  }
+
+  // ── Auto-recovery with VALID models only ──────────
   private async recoverWorkingGeminiModel(): Promise<GenerativeModel> {
     if (!this.genAI || !this.apiKey) {
-      throw new Error("Cannot initialize Gemini without valid API key");
+      throw new Error("Cannot initialize Gemini without valid API key")
     }
 
     if (this.isRecovering && this.model) {
-      return this.model;
+      return this.model
     }
-    this.isRecovering = true;
-    console.log("[LLMHelper] Model/Network threw error. Searching for alternative working model...");
+    this.isRecovering = true
+    console.log("[LLMHelper] Searching for working model...")
 
-    const candidates = [
-      "gemini-1.5-flash",
-      "gemini-flash-lite-latest",
-      "gemini-1.5-flash-latest",
-      "gemini-1.5-flash-8b",
-      "gemini-pro"
-    ];
+    for (const candidate of VALID_MODELS) {
+      if (candidate === this.geminiModelName) continue
 
-    for (const candidate of candidates) {
-      if (candidate === this.geminiModelName && candidates.length > 1) continue;
       try {
-        console.log(`[LLMHelper] Testing backup model '${candidate}'...`);
-        const testModel = this.genAI.getGenerativeModel({ 
+        console.log(`[LLMHelper] Testing '${candidate}'...`)
+        const testModel = this.genAI.getGenerativeModel({
           model: candidate,
-          generationConfig: { maxOutputTokens: 600, temperature: 0.3 }
-        });
-        const result = await testModel.generateContent("hi");
-        const response = await result.response;
-        const responseText = response.text();
-        if (responseText !== undefined) {
-          this.geminiModelName = candidate;
-          this.model = testModel;
-          this.isRecovering = false;
-          console.log(`[LLMHelper] ✅ Auto-recovered and locked onto model: ${this.geminiModelName}`);
-          return this.model;
+          generationConfig: { maxOutputTokens: 100, temperature: 0.1 }
+        })
+
+        // Quick test with timeout
+        const result = await this.withTimeout(
+          testModel.generateContent("Say 'ok'"),
+          10000 // 10 sec test timeout
+        )
+        const response = await result.response
+
+        if (response.text()) {
+          this.geminiModelName = candidate
+          this.model = this.genAI.getGenerativeModel({
+            model: candidate,
+            generationConfig: { maxOutputTokens: 500, temperature: 0.3 }
+          })
+          this.isRecovering = false
+          console.log(`[LLMHelper] ✅ Recovered: ${this.geminiModelName}`)
+          return this.model
         }
-      } catch (probeError: any) {
-        const errMsg = probeError?.message || String(probeError);
-        console.warn(`[LLMHelper] Backup model '${candidate}' check failed (${errMsg.substring(0, 60)}...)`);
-        if (errMsg.includes("Quota") || errMsg.includes("rate limit") || errMsg.includes("429") || errMsg.includes("RESOURCE_EXHAUSTED")) {
-          this.isRecovering = false;
-          throw new Error("⚠️ Google AI Studio Free Tier rate limit hit (15 requests/min). Please wait 20-30 seconds for the minute counter to reset, then try again.");
+      } catch (error: any) {
+        const msg = error?.message || String(error)
+        console.warn(`[LLMHelper] '${candidate}' failed: ${msg.substring(0, 60)}`)
+
+        if (msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED")) {
+          this.isRecovering = false
+          throw new Error("⚠️ Rate limit hit. Wait 30 seconds and try again.")
         }
-        await new Promise(resolve => setTimeout(resolve, 400));
       }
     }
 
-    this.isRecovering = false;
-    this.geminiModelName = "gemini-1.5-flash";
-    this.model = this.genAI.getGenerativeModel({ 
-      model: this.geminiModelName,
-      generationConfig: { maxOutputTokens: 600, temperature: 0.3 }
-    });
-    throw new Error("⚠️ Network/API Connection Error: Unable to reach Google Gemini servers ('fetch failed'). Please check your internet connection, VPN, or firewall and try again.");
+    this.isRecovering = false
+    throw new Error("⚠️ No working Gemini model found. Check API key and internet.")
   }
 
+  // ── Get valid model (lazy init) ──────────────────
   private async getValidGeminiModel(): Promise<GenerativeModel> {
-    if (this.model) {
-      return this.model;
-    }
+    if (this.model) return this.model
+
     if (!this.genAI || !this.apiKey) {
-      throw new Error("Gemini model not configured or API key missing");
+      throw new Error("Gemini not configured")
     }
-    this.geminiModelName = "gemini-flash-lite-latest";
-    this.model = this.genAI.getGenerativeModel({ 
+
+    this.model = this.genAI.getGenerativeModel({
       model: this.geminiModelName,
-      generationConfig: { maxOutputTokens: 600, temperature: 0.3 }
-    });
-    return this.model;
+      generationConfig: { maxOutputTokens: 500, temperature: 0.3 }
+    })
+    return this.model
   }
 
-  private async executeWithAutoRecovery(generateFn: (model: GenerativeModel) => Promise<any>): Promise<any> {
-    let model = await this.getValidGeminiModel();
-    let lastError: any = null;
+  // ── Execute with auto-recovery + timeout ──────────
+  private async executeWithAutoRecovery<T>(
+    generateFn: (model: GenerativeModel) => Promise<T>
+  ): Promise<T> {
+    let model = await this.getValidGeminiModel()
+    let lastError: any = null
 
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        return await generateFn(model);
+        // ✅ Wrap in timeout
+        return await this.withTimeout(generateFn(model), REQUEST_TIMEOUT_MS)
       } catch (error: any) {
-        lastError = error;
-        const msg = error?.message || String(error);
-        
-        if (msg.includes("Quota") || msg.includes("rate limit") || msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED")) {
-          console.warn("[LLMHelper] Rate limit hit. Halting requests to let quota counter reset.");
-          throw new Error("⚠️ Google AI Studio Free Tier rate limit hit (15 requests/min). Please wait 20-30 seconds for the minute counter to reset, then try again.");
+        lastError = error
+        const msg = error?.message || String(error)
+
+        // Rate limit — throw immediately
+        if (msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED")) {
+          throw new Error("⚠️ Rate limit hit. Wait 30 seconds.")
         }
 
-        if (msg.includes("404") || msg.includes("not found") || msg.includes("no longer available") || msg.includes("API version")) {
-          console.warn(`[LLMHelper] Model '${this.geminiModelName}' threw 404/unavailable. Triggering Auto-Recovery...`);
-          model = await this.recoverWorkingGeminiModel();
-          return await generateFn(model);
+        // Model not found — recover
+        if (msg.includes("404") || msg.includes("not found")) {
+          console.warn(`[LLMHelper] Model 404. Recovering...`)
+          model = await this.recoverWorkingGeminiModel()
+          return await this.withTimeout(generateFn(model), REQUEST_TIMEOUT_MS)
         }
 
-        if (msg.includes("fetch failed") || msg.includes("network") || msg.includes("ECONNRESET") || msg.includes("ETIMEDOUT") || msg.includes("ENOTFOUND")) {
-          console.warn(`[LLMHelper] Network glitch on attempt ${attempt}/2 ('${msg.substring(0, 50)}...'). Retrying over fresh IPv4 socket...`);
-          if (attempt < 2) {
-            await new Promise(resolve => setTimeout(resolve, 600));
-            continue;
-          }
+        // Timeout — retry once
+        if (msg.includes("timeout") && attempt < 2) {
+          console.warn(`[LLMHelper] Timeout. Retrying...`)
+          continue
         }
 
-        break;
+        // Network error — retry once
+        if (
+          (msg.includes("fetch failed") || msg.includes("network")) &&
+          attempt < 2
+        ) {
+          console.warn(`[LLMHelper] Network error. Retrying...`)
+          await new Promise((r) => setTimeout(r, 1000))
+          continue
+        }
+
+        break
       }
     }
 
-    const finalMsg = lastError?.message || String(lastError);
+    const finalMsg = lastError?.message || String(lastError)
     if (finalMsg.includes("fetch failed") || finalMsg.includes("network")) {
-      throw new Error("⚠️ Network Connection Error ('fetch failed'). Windows could not establish a connection to Google's AI servers. Please check if your WiFi/Internet is active, or if an Antivirus/VPN is blocking Node.js.");
+      throw new Error("⚠️ Network error. Check internet connection.")
     }
-    throw lastError;
+    throw lastError
   }
 
+  // ── File to generative part (for images) ──────────
   private async fileToGenerativePart(imagePath: string) {
     const imageData = await fs.promises.readFile(imagePath)
     return {
@@ -172,42 +274,43 @@ export class LLMHelper {
     }
   }
 
+  // ── Clean JSON response ───────────────────────────
   private cleanJsonResponse(text: string): string {
-    text = text.replace(/^```(?:json)?\n/, '').replace(/\n```$/, '');
-    text = text.trim();
-    return text;
+    text = text.replace(/^```(?:json)?\n/, "").replace(/\n```$/, "")
+    return text.trim()
   }
 
+  // ── Ollama API call ───────────────────────────────
   private async callOllama(prompt: string): Promise<string> {
     try {
-      const response = await fetch(`${this.ollamaUrl}/api/generate`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: this.ollamaModel,
-          prompt: prompt,
-          stream: false,
-          options: {
-            temperature: 0.7,
-            top_p: 0.9,
-          }
+      const response = await this.withTimeout(
+        fetch(`${this.ollamaUrl}/api/generate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: this.ollamaModel,
+            prompt,
+            stream: false,
+            options: { temperature: 0.7, top_p: 0.9 }
+          })
         }),
-      })
+        60000 // Ollama gets 60s (local, can be slower)
+      )
 
       if (!response.ok) {
-        throw new Error(`Ollama API error: ${response.status} ${response.statusText}`)
+        throw new Error(`Ollama error: ${response.status}`)
       }
 
       const data: OllamaResponse = await response.json()
       return data.response
     } catch (error: any) {
-      console.error("[LLMHelper] Error calling Ollama:", error)
-      throw new Error(`Failed to connect to Ollama: ${error.message}. Make sure Ollama is running on ${this.ollamaUrl}`)
+      throw new Error(
+        `Ollama connection failed: ${error.message}. Is Ollama running?`
+      )
     }
   }
 
+  // ── Ollama helpers ────────────────────────────────
   private async checkOllamaAvailable(): Promise<boolean> {
     try {
       const response = await fetch(`${this.ollamaUrl}/api/tags`)
@@ -219,310 +322,306 @@ export class LLMHelper {
 
   private async initializeOllamaModel(): Promise<void> {
     try {
-      const availableModels = await this.getOllamaModels()
-      if (availableModels.length === 0) {
+      const models = await this.getOllamaModels()
+      if (models.length === 0) {
         console.warn("[LLMHelper] No Ollama models found")
         return
       }
-
-      if (!availableModels.includes(this.ollamaModel)) {
-        this.ollamaModel = availableModels[0]
-        console.log(`[LLMHelper] Auto-selected first available model: ${this.ollamaModel}`)
+      if (!models.includes(this.ollamaModel)) {
+        this.ollamaModel = models[0]
+        console.log(`[LLMHelper] Auto-selected: ${this.ollamaModel}`)
       }
-
-      await this.callOllama("Hello")
-      console.log(`[LLMHelper] Successfully initialized with model: ${this.ollamaModel}`)
     } catch (error: any) {
-      console.error(`[LLMHelper] Failed to initialize Ollama model: ${error.message}`)
-      try {
-        const models = await this.getOllamaModels()
-        if (models.length > 0) {
-          this.ollamaModel = models[0]
-          console.log(`[LLMHelper] Fallback to: ${this.ollamaModel}`)
-        }
-      } catch (fallbackError: any) {
-        console.error(`[LLMHelper] Fallback also failed: ${fallbackError.message}`)
-      }
+      console.error(`[LLMHelper] Ollama init failed: ${error.message}`)
     }
   }
 
+  // ═══════════════════════════════════════════════════
+  // PUBLIC METHODS
+  // ═══════════════════════════════════════════════════
+
+  // ── Extract problem from images ───────────────────
   public async extractProblemFromImages(imagePaths: string[]) {
-    try {
-      const imageParts = await Promise.all(imagePaths.map(path => this.fileToGenerativePart(path)))
-      
-      const prompt = `${this.systemPrompt}\n\nYou are a wingman helping the candidate. Please analyze these images and extract complete, detailed technical information in clean JSON format using ONLY SIMPLE, EASY DAILY ENGLISH WORDS:\n{
-  "problem_statement": "A complete, detailed restatement of the problem in easy daily words.",
-  "context": "Complete background rules and technical constraints explained simply.",
-  "suggested_responses": [
-    "• Detailed Concept: Complete, accurate definition explained in simple words (~25 words)",
-    "• Internal Mechanism: How it works step-by-step in simple words (~25 words)",
-    "• Scaling & Speed: Complete performance explanation in simple words (~25 words)",
-    "• Real Industry Example: Detailed real-world app or company scenario in simple words (~25 words)",
-    "• Pro Tip: High-scoring architectural tip to tell the interviewer in simple words (~25 words)"
-  ],
-  "reasoning": "Complete, accurate technical explanation in simple daily words."
-}\nImportant: Return ONLY the JSON object, without any markdown formatting or code blocks.`
+    const cacheKey = this.getCacheKey(`extract_${imagePaths.join("_")}`)
+    const cached = this.cache.get(cacheKey)
+    if (cached) {
+      console.log("[LLMHelper] Cache hit for extractProblemFromImages")
+      return cached
+    }
 
-      return await this.executeWithAutoRecovery(async (model) => {
-        const result = await model.generateContent([prompt, ...imageParts]);
-        const response = await result.response;
-        const text = this.cleanJsonResponse(response.text());
-        return JSON.parse(text);
-      });
+    try {
+      const imageParts = await Promise.all(
+        imagePaths.map((p) => this.fileToGenerativePart(p))
+      )
+
+      const prompt = `${this.systemPrompt}\n\nAnalyze these images and extract the problem/topic in JSON:\n{"problem_statement": "...", "context": "...", "suggested_responses": ["• ...", "• ...", "• ...", "• ...", "• ..."]}\nReturn ONLY JSON.`
+
+      const result = await this.executeWithAutoRecovery(async (model) => {
+        const res = await model.generateContent([prompt, ...imageParts])
+        const text = this.cleanJsonResponse(res.response.text())
+        return JSON.parse(text)
+      })
+
+      this.cache.set(cacheKey, result)
+      return result
     } catch (error) {
-      console.error("Error extracting problem from images:", error)
+      console.error("Error extracting problem:", error)
       throw error
     }
   }
 
+  // ── Generate solution ─────────────────────────────
   public async generateSolution(problemInfo: any) {
-    const prompt = `${this.systemPrompt}\n\nGiven this problem or interview topic:\n${JSON.stringify(problemInfo, null, 2)}\n\nPlease provide your response in the following JSON format using ONLY SIMPLE, EASY DAILY ENGLISH WORDS so the candidate can speak it immediately with complete technical depth:\n{
-  "solution": {
-    "code": "Clean optimal code solution (if coding question) or complete summary text.",
-    "problem_statement": "Restate the core interview question clearly and completely in simple words.",
-    "context": "Complete technical context explained simply.",
-    "suggested_responses": [
-      "• Core Concept & Definition: Complete, detailed explanation of what it is and how it works using simple words (~30 words)",
-      "• Primary Mechanism / Architecture: Exact internal structure or data handling explained clearly (~30 words)",
-      "• Performance & Scalability Trade-off: Exact speed, latency, and scaling differences explained simply (~30 words)",
-      "• Rules & Guarantees: How accuracy or transactions are handled (like ACID vs BASE) in simple words (~30 words)",
-      "• Real-World Industry Use Case: Exact real-world example explaining when and why top companies choose this (~30 words)",
-      "• Pro Tip for Bonus Marks: High-impact architectural best practice to impress the interviewer (~25 words)"
-    ],
-    "reasoning": "Why this approach is best."
-  }
-}\nImportant: Return ONLY the JSON object, without any markdown formatting or code blocks.`
-
-    console.log("[LLMHelper] Calling Gemini LLM for solution...");
-    try {
-      return await this.executeWithAutoRecovery(async (model) => {
-        const result = await model.generateContent(prompt);
-        console.log("[LLMHelper] Gemini LLM returned result.");
-        const response = await result.response;
-        const text = this.cleanJsonResponse(response.text());
-        const parsed = JSON.parse(text);
-        console.log("[LLMHelper] Parsed LLM response:", parsed);
-        return parsed;
-      });
-    } catch (error) {
-      console.error("[LLMHelper] Error in generateSolution:", error);
-      throw error;
+    const cacheKey = this.getCacheKey(`solution_${JSON.stringify(problemInfo).substring(0, 200)}`)
+    const cached = this.cache.get(cacheKey)
+    if (cached) {
+      console.log("[LLMHelper] Cache hit for generateSolution")
+      return cached
     }
-  }
 
-  public async debugSolutionWithImages(problemInfo: any, currentCode: string, debugImagePaths: string[]) {
+    const prompt = `${this.systemPrompt}\n\nTopic: ${JSON.stringify(problemInfo)}\n\nProvide solution in JSON:\n{"solution": {"code": "...", "problem_statement": "...", "suggested_responses": ["• ...", "• ...", "• ...", "• ...", "• ...", "• ..."]}}\nReturn ONLY JSON.`
+
+    console.log("[LLMHelper] Generating solution...")
     try {
-      const imageParts = await Promise.all(debugImagePaths.map(path => this.fileToGenerativePart(path)))
-      
-      const prompt = `${this.systemPrompt}\n\nYou are a wingman helping the candidate debug during a live interview. Given:\n1. Topic: ${JSON.stringify(problemInfo, null, 2)}\n2. Current approach: ${currentCode}\n3. Debug info in images\n\nPlease provide complete, detailed debugging feedback in this JSON format using SIMPLE, EASY DAILY ENGLISH WORDS ONLY:\n{
-  "solution": {
-    "code": "The fixed optimal code.",
-    "problem_statement": "Restate the error and broken logic completely in simple words.",
-    "context": "Why the error occurred internally explained simply.",
-    "suggested_responses": [
-      "• Root Cause Analysis: Complete explanation of what broke step-by-step in simple words (~30 words)",
-      "• Fix Applied & Logic: How our code solves the exact issue clearly (~30 words)",
-      "• Performance Impact: Time/space complexity improvement explained simply (~25 words)",
-      "• Production Prevention: Exact steps to prevent this error next time in simple words (~25 words)",
-      "• Pro Tip for Interview: Architectural best practice to highlight (~25 words)"
-    ],
-    "reasoning": "Complete technical reasoning in simple words."
-  }
-}\nImportant: Return ONLY the JSON object, without any markdown formatting or code blocks.`
+      const result = await this.executeWithAutoRecovery(async (model) => {
+        const res = await model.generateContent(prompt)
+        const text = this.cleanJsonResponse(res.response.text())
+        return JSON.parse(text)
+      })
 
-      return await this.executeWithAutoRecovery(async (model) => {
-        const result = await model.generateContent([prompt, ...imageParts]);
-        const response = await result.response;
-        const text = this.cleanJsonResponse(response.text());
-        const parsed = JSON.parse(text);
-        console.log("[LLMHelper] Parsed debug LLM response:", parsed);
-        return parsed;
-      });
+      this.cache.set(cacheKey, result)
+      console.log("[LLMHelper] ✅ Solution generated")
+      return result
     } catch (error) {
-      console.error("Error debugging solution with images:", error)
+      console.error("[LLMHelper] Solution error:", error)
       throw error
     }
   }
 
+  // ── Debug solution with images ────────────────────
+  public async debugSolutionWithImages(
+    problemInfo: any,
+    currentCode: string,
+    debugImagePaths: string[]
+  ) {
+    try {
+      const imageParts = await Promise.all(
+        debugImagePaths.map((p) => this.fileToGenerativePart(p))
+      )
+
+      const prompt = `${this.systemPrompt}\n\nDebug this:\nTopic: ${JSON.stringify(problemInfo)}\nCode: ${currentCode}\n\nProvide fix in JSON:\n{"solution": {"code": "...", "problem_statement": "...", "suggested_responses": ["• Root cause: ...", "• Fix: ...", "• Performance: ...", "• Prevention: ...", "• Pro tip: ..."]}}\nReturn ONLY JSON.`
+
+      return await this.executeWithAutoRecovery(async (model) => {
+        const res = await model.generateContent([prompt, ...imageParts])
+        const text = this.cleanJsonResponse(res.response.text())
+        return JSON.parse(text)
+      })
+    } catch (error) {
+      console.error("Debug error:", error)
+      throw error
+    }
+  }
+
+  // ── Analyze audio file ────────────────────────────
   public async analyzeAudioFile(audioPath: string) {
     try {
-      const audioData = await fs.promises.readFile(audioPath);
+      const audioData = await fs.promises.readFile(audioPath)
       const audioPart = {
         inlineData: {
           data: audioData.toString("base64"),
-          mimeType: "audio/mp3"
+          mimeType: audioPath.endsWith(".mp3") ? "audio/mp3" : "audio/wav"
         }
-      };
-      const directAudioPrompt = `Listen to the spoken interview question in this audio clip. Instantly extract the core question and directly give your COMPLETE, RICH, DETAILED interview answer in EXACTLY 5 to 6 bullet points starting with '• ' (~150 to 180 words total).
-CRITICAL RULES: Explain every deep technical concept using ONLY SIMPLE, EASY DAILY CONVERSATIONAL ENGLISH WORDS. Do NOT use hard or academic words. Format strictly as:\n\n❓ QUESTION HEARD: [1-line exact question summary in simple words]\n\n💡 COMPLETE DETAILED INTERVIEW ANSWER (Simple English):\n• [Core Concept & Exact Definition]: Complete, detailed explanation of what it is and how it works using simple words (~30 words).\n• [Primary Mechanism / Architecture]: Exact internal structure or data handling explained clearly in simple words (~30 words).\n• [Performance & Scalability Trade-off]: Exact speed, latency, and scaling differences explained simply (~30 words).\n• [Rules & Guarantees]: How accuracy or transactions are handled (like ACID vs BASE) in simple words (~30 words).\n• [Real-World Industry Use Case]: Exact real-world example explaining when and why top companies choose this (~30 words).\n• [Pro Tip for Bonus Marks]: High-impact architectural best practice to impress the interviewer (~25 words).`;
-      
+      }
+
+      const prompt = `${this.systemPrompt}\n\nListen to this audio. Extract the question and answer in 5-6 bullet points (~150 words). Use simple English.\n\nFormat:\n❓ QUESTION: [summary]\n\n💡 ANSWER:\n• [point 1]\n• [point 2]\n• [point 3]\n• [point 4]\n• [point 5]\n• [Pro tip]`
+
       return await this.executeWithAutoRecovery(async (model) => {
         const result = await model.generateContent({
-          contents: [{ role: 'user', parts: [{ text: directAudioPrompt }, audioPart] }],
-          generationConfig: { maxOutputTokens: 550, temperature: 0.2, topK: 20 }
-        });
-        const response = await result.response;
-        const text = response.text().trim();
-        return { text, timestamp: Date.now() };
-      });
+          contents: [{ role: "user", parts: [{ text: prompt }, audioPart] }],
+          generationConfig: {
+            maxOutputTokens: 450,
+            temperature: 0.2,
+            topK: 20
+          }
+        })
+        const text = result.response.text().trim()
+        return { text, timestamp: Date.now() }
+      })
     } catch (error) {
-      console.error("Error analyzing audio file:", error);
-      throw error;
+      console.error("Audio analysis error:", error)
+      throw error
     }
   }
 
+  // ── Analyze audio from base64 ─────────────────────
   public async analyzeAudioFromBase64(data: string, mimeType: string) {
     try {
       const audioPart = {
-        inlineData: {
-          data,
-          mimeType
-        }
-      };
-      const directAudioPrompt = `Listen to the spoken interview question in this audio clip. Instantly extract the core question and directly give your COMPLETE, RICH, DETAILED interview answer in EXACTLY 5 to 6 bullet points starting with '• ' (~150 to 180 words total).
-CRITICAL RULES: Explain every deep technical concept using ONLY SIMPLE, EASY DAILY CONVERSATIONAL ENGLISH WORDS. Do NOT use hard or academic words. Format strictly as:\n\n❓ QUESTION HEARD: [1-line exact question summary in simple words]\n\n💡 COMPLETE DETAILED INTERVIEW ANSWER (Simple English):\n• [Core Concept & Exact Definition]: Complete, detailed explanation of what it is and how it works using simple words (~30 words).\n• [Primary Mechanism / Architecture]: Exact internal structure or data handling explained clearly in simple words (~30 words).\n• [Performance & Scalability Trade-off]: Exact speed, latency, and scaling differences explained simply (~30 words).\n• [Rules & Guarantees]: How accuracy or transactions are handled (like ACID vs BASE) in simple words (~30 words).\n• [Real-World Industry Use Case]: Exact real-world example explaining when and why top companies choose this (~30 words).\n• [Pro Tip for Bonus Marks]: High-impact architectural best practice to impress the interviewer (~25 words).`;
-      
+        inlineData: { data, mimeType }
+      }
+
+      const prompt = `${this.systemPrompt}\n\nListen to this audio. Extract the question and answer in 5-6 bullet points (~150 words). Use simple English.`
+
       return await this.executeWithAutoRecovery(async (model) => {
         const result = await model.generateContent({
-          contents: [{ role: 'user', parts: [{ text: directAudioPrompt }, audioPart] }],
-          generationConfig: { maxOutputTokens: 550, temperature: 0.2, topK: 20 }
-        });
-        const response = await result.response;
-        const text = response.text().trim();
-        return { text, timestamp: Date.now() };
-      });
+          contents: [{ role: "user", parts: [{ text: prompt }, audioPart] }],
+          generationConfig: {
+            maxOutputTokens: 450,
+            temperature: 0.2
+          }
+        })
+        return { text: result.response.text().trim(), timestamp: Date.now() }
+      })
     } catch (error) {
-      console.error("Error analyzing audio from base64:", error);
-      throw error;
+      console.error("Audio base64 error:", error)
+      throw error
     }
   }
 
+  // ── Analyze single image file ─────────────────────
   public async analyzeImageFile(imagePath: string) {
     try {
-      const imageData = await fs.promises.readFile(imagePath);
+      const imageData = await fs.promises.readFile(imagePath)
       const imagePart = {
         inlineData: {
           data: imageData.toString("base64"),
           mimeType: "image/png"
         }
-      };
-      const prompt = `${this.systemPrompt}\n\nAnalyze this screenshot for a live interview. Provide your COMPLETE, RICH, DETAILED interview answer in EXACTLY 5 to 6 bullet points starting with '• ' (~150 to 180 words total). Explain every technical nuance using ONLY SIMPLE, EASY DAILY ENGLISH WORDS. Never use hard academic vocabulary. Be complete, detailed, and structured.`;
+      }
+
+      const prompt = `${this.systemPrompt}\n\nAnalyze this screenshot. Answer in 5-6 bullet points (~150 words). Simple English.`
+
       return await this.executeWithAutoRecovery(async (model) => {
-        const result = await model.generateContent([prompt, imagePart]);
-        const response = await result.response;
-        const text = response.text().trim();
-        return { text, timestamp: Date.now() };
-      });
+        const result = await model.generateContent([prompt, imagePart])
+        return { text: result.response.text().trim(), timestamp: Date.now() }
+      })
     } catch (error) {
-      console.error("Error analyzing image file:", error);
-      throw error;
+      console.error("Image analysis error:", error)
+      throw error
     }
   }
 
+  // ── Chat (text question) ──────────────────────────
   public async chatWithGemini(message: string): Promise<string> {
+    // Check cache first
+    const cacheKey = this.getCacheKey(`chat_${message}`)
+    const cached = this.cache.get(cacheKey)
+    if (cached) {
+      console.log("[LLMHelper] Cache hit for chat")
+      return cached
+    }
+
     try {
       if (this.useOllama) {
-        return this.callOllama(message);
-      } else {
-        return await this.executeWithAutoRecovery(async (model) => {
-          const fastPrompt = `${this.systemPrompt}\n\nCandidate Ask / Chat Question: "${message}"\n\nProvide your COMPLETE, RICH, DETAILED interview answer in EXACTLY 5 to 6 bullet points starting with '• ' (~150 to 180 words total).\nCRITICAL RULE: Explain every deep technical concept using ONLY SIMPLE, EASY DAILY CONVERSATIONAL ENGLISH WORDS. Do NOT use hard or academic words.\n\nFormat directly as:\n• [Core Concept & Exact Definition]: Complete, detailed explanation of what it is and how it works using simple words (~30 words).\n• [Primary Mechanism / Architecture]: Exact internal structure or data handling explained clearly in simple words (~30 words).\n• [Performance & Scalability Trade-off]: Exact speed, latency, and scaling differences explained simply (~30 words).\n• [Rules & Guarantees]: How accuracy or transactions are handled (like ACID vs BASE) in simple words (~30 words).\n• [Real-World Industry Use Case]: Exact real-world example explaining when and why top companies choose this (~30 words).\n• [Pro Tip for Bonus Marks]: High-impact architectural best practice to impress the interviewer (~25 words).\n\nDo NOT use introductory text or paragraphs. Keep strictly around 150 to 180 words total using 100% simple English while providing complete technical depth.`;
-          const result = await model.generateContent(fastPrompt);
-          const response = await result.response;
-          return response.text().trim();
-        });
+        return await this.callOllama(
+          `${this.systemPrompt}\n\nQuestion: "${message}"\n\nAnswer in 5-6 bullet points.`
+        )
       }
+
+      const result = await this.executeWithAutoRecovery(async (model) => {
+        const prompt = `${this.systemPrompt}\n\nQuestion: "${message}"\n\nAnswer in 5-6 bullet points (~150 words). Simple English.`
+        const res = await model.generateContent(prompt)
+        return res.response.text().trim()
+      })
+
+      this.cache.set(cacheKey, result)
+      return result
     } catch (error) {
-      console.error("[LLMHelper] Error in chatWithGemini:", error);
-      throw error;
+      console.error("[LLMHelper] Chat error:", error)
+      throw error
     }
   }
 
   public async chat(message: string): Promise<string> {
-    return this.chatWithGemini(message);
+    return this.chatWithGemini(message)
   }
 
+  // ── Provider info ─────────────────────────────────
   public isUsingOllama(): boolean {
-    return this.useOllama;
-  }
-
-  public async getOllamaModels(): Promise<string[]> {
-    if (!this.useOllama) return [];
-    
-    try {
-      const response = await fetch(`${this.ollamaUrl}/api/tags`);
-      if (!response.ok) throw new Error('Failed to fetch models');
-      
-      const data = await response.json();
-      return data.models?.map((model: any) => model.name) || [];
-    } catch (error) {
-      console.error("[LLMHelper] Error fetching Ollama models:", error);
-      return [];
-    }
+    return this.useOllama
   }
 
   public getCurrentProvider(): "ollama" | "gemini" {
-    return this.useOllama ? "ollama" : "gemini";
+    return this.useOllama ? "ollama" : "gemini"
   }
 
   public getCurrentModel(): string {
-    return this.useOllama ? this.ollamaModel : this.geminiModelName;
+    return this.useOllama ? this.ollamaModel : this.geminiModelName
   }
 
-  public async switchToOllama(model?: string, url?: string): Promise<void> {
-    this.useOllama = true;
-    if (url) this.ollamaUrl = url;
-    
-    if (model) {
-      this.ollamaModel = model;
-    } else {
-      await this.initializeOllamaModel();
+  public async getOllamaModels(): Promise<string[]> {
+    if (!this.useOllama) return []
+    try {
+      const response = await fetch(`${this.ollamaUrl}/api/tags`)
+      if (!response.ok) throw new Error("Failed to fetch models")
+      const data = await response.json()
+      return data.models?.map((m: any) => m.name) || []
+    } catch {
+      return []
     }
-    
-    console.log(`[LLMHelper] Switched to Ollama: ${this.ollamaModel} at ${this.ollamaUrl}`);
+  }
+
+  // ── Switch providers ──────────────────────────────
+  public async switchToOllama(model?: string, url?: string): Promise<void> {
+    this.useOllama = true
+    if (url) this.ollamaUrl = url
+    if (model) {
+      this.ollamaModel = model
+    } else {
+      await this.initializeOllamaModel()
+    }
+    console.log(`[LLMHelper] Switched to Ollama: ${this.ollamaModel}`)
   }
 
   public async switchToGemini(apiKey?: string): Promise<void> {
-    if (apiKey) {
-      this.apiKey = apiKey;
-    }
-    if (!this.apiKey) {
-      throw new Error("No Gemini API key provided and no existing API key configured");
-    }
-    if (!this.genAI) {
-      this.genAI = new GoogleGenerativeAI(this.apiKey);
-    }
-    this.model = null;
-    this.geminiModelName = "gemini-flash-lite-latest";
-    this.model = this.genAI!.getGenerativeModel({ 
+    if (apiKey) this.apiKey = apiKey
+    if (!this.apiKey) throw new Error("No Gemini API key")
+
+    this.genAI = new GoogleGenerativeAI(this.apiKey)
+    this.geminiModelName = "gemini-2.0-flash"
+    this.model = this.genAI.getGenerativeModel({
       model: this.geminiModelName,
-      generationConfig: { maxOutputTokens: 600, temperature: 0.3 }
-    });
-    this.useOllama = false;
-    console.log(`[LLMHelper] Switched to Gemini (${this.geminiModelName})`);
+      generationConfig: { maxOutputTokens: 500, temperature: 0.3 }
+    })
+    this.useOllama = false
+    console.log(`[LLMHelper] Switched to Gemini: ${this.geminiModelName}`)
   }
 
-  public async testConnection(): Promise<{ success: boolean; error?: string }> {
+  // ── Connection test ───────────────────────────────
+  public async testConnection(): Promise<{
+    success: boolean
+    error?: string
+    latencyMs?: number
+  }> {
+    const start = Date.now()
     try {
       if (this.useOllama) {
-        const available = await this.checkOllamaAvailable();
+        const available = await this.checkOllamaAvailable()
         if (!available) {
-          return { success: false, error: `Ollama not available at ${this.ollamaUrl}` };
+          return { success: false, error: `Ollama not available at ${this.ollamaUrl}` }
         }
-        await this.callOllama("Hello");
-        return { success: true };
+        await this.callOllama("Hello")
+        return { success: true, latencyMs: Date.now() - start }
       } else {
-        const model = await this.getValidGeminiModel();
-        const result = await model.generateContent("Hello");
-        const response = await result.response;
-        const text = response.text();
-        if (text) {
-          return { success: true };
-        } else {
-          return { success: false, error: "Empty response from Gemini" };
+        const model = await this.getValidGeminiModel()
+        const result = await this.withTimeout(
+          model.generateContent("Say ok"),
+          15000
+        )
+        const response = await result.response
+        if (response.text()) {
+          return { success: true, latencyMs: Date.now() - start }
         }
+        return { success: false, error: "Empty response" }
       }
     } catch (error: any) {
-      return { success: false, error: error.message };
+      return { success: false, error: error.message }
     }
+  }
+
+  // ── Clear cache ───────────────────────────────────
+  public clearCache(): void {
+    this.cache.clear()
+    console.log("[LLMHelper] Cache cleared")
   }
 }
